@@ -1,268 +1,333 @@
-const express = require('express');
-const axios = require('axios');
-const Database = require('better-sqlite3');
-const crypto = require('crypto');
+/**
+ * ============================================================
+ *  HitClub MD5 - Dự đoán Tài/Xỉu thông minh
+ *  Thuật toán: Phân tích cầu đa tầng + Bayes + Streak detection
+ * ============================================================
+ */
 
-// ================= CẤU HÌNH =================
-const API_SOURCE = "https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu";
-const PLATFORM_ID = "g8";
-const GID_DEFAULT = "default";    // gid mẫu, có thể thay đổi qua query param
-const SECRET_KEY = "my_secret_2025";
-const FETCH_INTERVAL = 3000;      // 3 giây
-const HISTORY_LIMIT = 200;        // số phiên lấy về để phân tích
+const API_URL = "https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=g8&gid={gid}";
 
-// ================= DATABASE =================
-const db = new Database('taixiu.db');
-db.pragma('journal_mode = WAL'); // hiệu năng tốt hơn
+// ──────────────────────────────────────────────
+//  CẤU HÌNH
+// ──────────────────────────────────────────────
+const CONFIG = {
+  HISTORY_SIZE: 30,        // Số phiên lịch sử giữ lại
+  POLL_INTERVAL_MS: 5000,  // Khoảng cách gọi API (ms)
+  MAX_WRONG_STREAK: 3,     // Ngưỡng sai liên tiếp → tự điều chỉnh
+  WEIGHTS: {
+    streak:   0.35,        // Trọng số cầu liên tiếp
+    pattern:  0.25,        // Trọng số nhận dạng pattern
+    bayes:    0.25,        // Trọng số Bayes tần suất
+    api:      0.15,        // Trọng số gợi ý từ API nguồn
+  },
+};
 
-// Khởi tạo bảng
-db.exec(`
-  CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE,
-    result TEXT,
-    timestamp TEXT
-  );
-  CREATE TABLE IF NOT EXISTS predictions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE,
-    prediction TEXT,
-    md5_hash TEXT,
-    created_at TEXT,
-    actual_result TEXT
-  );
-`);
+// ──────────────────────────────────────────────
+//  TRẠNG THÁI TOÀN CỤC
+// ──────────────────────────────────────────────
+const state = {
+  history: [],          // [{ phien, ket_qua, xuc_xac, tong }]
+  predictions: [],      // [{ phien, du_doan, ket_qua, dung }]
+  wrongStreak: 0,
+  totalPredictions: 0,
+  totalCorrect: 0,
+  lastPhien: null,
+};
 
-// ================= TRUY VẤN DB =================
-function saveResult(session_id, result, ts) {
-  const stmt = db.prepare('INSERT OR IGNORE INTO history (session_id, result, timestamp) VALUES (?, ?, ?)');
-  stmt.run(session_id, result, ts);
+// ──────────────────────────────────────────────
+//  TIỆN ÍCH
+// ──────────────────────────────────────────────
+function tong(xucXac) {
+  return xucXac.reduce((a, b) => a + b, 0);
 }
 
-function getHistory(limit = 200) {
-  // Lấy từ cũ nhất đến mới nhất để phân tích cầu
-  const rows = db.prepare('SELECT session_id, result FROM history ORDER BY id ASC LIMIT ?').all(limit);
-  return rows; // [{session_id, result}]
+function label(t) {
+  return t >= 11 ? "Tài" : "Xỉu";
 }
 
-function getLastSessionId() {
-  const row = db.prepare('SELECT session_id FROM history ORDER BY id DESC LIMIT 1').get();
-  return row ? row.session_id : null;
+function now() {
+  return new Date().toLocaleTimeString("vi-VN");
 }
 
-function savePrediction(session_id, prediction, md5_hash) {
-  const stmt = db.prepare(`INSERT OR REPLACE INTO predictions (session_id, prediction, md5_hash, created_at) 
-                           VALUES (?, ?, ?, ?)`);
-  stmt.run(session_id, prediction, md5_hash, new Date().toISOString());
+function colorize(text, color) {
+  const codes = { green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m", cyan: "\x1b[36m", reset: "\x1b[0m" };
+  return `${codes[color] || ""}${text}${codes.reset}`;
 }
 
-function updatePredictionResult(session_id, actual) {
-  const stmt = db.prepare('UPDATE predictions SET actual_result = ? WHERE session_id = ?');
-  stmt.run(actual, session_id);
+// ──────────────────────────────────────────────
+//  GỌI API
+// ──────────────────────────────────────────────
+async function fetchLatest() {
+  const res = await fetch(API_URL);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
 
-function getPredictions(limit = 100) {
-  const rows = db.prepare('SELECT session_id, prediction, md5_hash, created_at, actual_result FROM predictions ORDER BY id DESC LIMIT ?').all(limit);
-  return rows;
+// ──────────────────────────────────────────────
+//  THUẬT TOÁN 1: STREAK DETECTION
+//  Phát hiện cầu đang chạy (bệt Tài / bệt Xỉu / cầu bàn)
+// ──────────────────────────────────────────────
+function analyzeStreak(hist) {
+  if (hist.length < 2) return { vote: null, confidence: 0 };
+
+  const results = hist.map(h => h.ket_qua);
+  const last = results[results.length - 1];
+
+  // Đếm streak cuối
+  let streak = 1;
+  for (let i = results.length - 2; i >= 0; i--) {
+    if (results[i] === last) streak++;
+    else break;
+  }
+
+  // Cầu bàn (xen kẽ T-X-T-X...)
+  let isAlternating = true;
+  for (let i = results.length - 1; i >= Math.max(0, results.length - 6); i--) {
+    if (i > 0 && results[i] === results[i - 1]) { isAlternating = false; break; }
+  }
+
+  if (isAlternating && results.length >= 4) {
+    // Cầu bàn → tiếp theo ngược lại
+    const next = last === "Tài" ? "Xỉu" : "Tài";
+    return { vote: next, confidence: 0.72 };
+  }
+
+  if (streak >= 5) {
+    // Cầu dài → có thể sắp gãy
+    const next = last === "Tài" ? "Xỉu" : "Tài";
+    return { vote: next, confidence: 0.60 };
+  }
+
+  if (streak >= 2 && streak <= 4) {
+    // Cầu đang chạy → theo cầu
+    return { vote: last, confidence: 0.55 + streak * 0.03 };
+  }
+
+  return { vote: last, confidence: 0.50 };
 }
 
-function getAccuracy() {
-  const total = db.prepare('SELECT COUNT(*) as count FROM predictions WHERE actual_result IS NOT NULL').get().count;
-  if (total === 0) return { total: 0, correct: 0, accuracy: 0 };
-  const correct = db.prepare('SELECT COUNT(*) as count FROM predictions WHERE prediction = actual_result AND actual_result IS NOT NULL').get().count;
+// ──────────────────────────────────────────────
+//  THUẬT TOÁN 2: NHẬN DẠNG PATTERN (chuỗi lặp)
+//  Tìm pattern độ dài 2-5 phiên lặp lại
+// ──────────────────────────────────────────────
+function analyzePattern(hist) {
+  if (hist.length < 6) return { vote: null, confidence: 0 };
+
+  const results = hist.map(h => h.ket_qua);
+  const n = results.length;
+
+  for (let len = 2; len <= 5; len++) {
+    const pattern = results.slice(n - len * 2, n - len);
+    const recent  = results.slice(n - len, n);
+
+    if (pattern.join(",") === recent.join(",")) {
+      // Pattern lặp lại hoàn toàn → dự đoán phần tử tiếp theo của pattern
+      const nextIdx = 0; // Phần tử kế tiếp trong pattern gốc (sau khi lặp)
+      // Lấy pattern một chu kỳ nữa từ vị trí tương ứng
+      const cyclePos = 0;
+      const vote = pattern[cyclePos];
+      return { vote, confidence: 0.70 + len * 0.02 };
+    }
+
+    // Kiểm tra match một phần (>= 80%)
+    let matchCount = 0;
+    for (let i = 0; i < len; i++) {
+      if (pattern[i] === recent[i]) matchCount++;
+    }
+    if (matchCount / len >= 0.8) {
+      return { vote: pattern[0], confidence: 0.62 };
+    }
+  }
+
+  return { vote: null, confidence: 0 };
+}
+
+// ──────────────────────────────────────────────
+//  THUẬT TOÁN 3: BAYES XÁC SUẤT TẦN SUẤT
+//  Dựa trên tổng xúc xắc phân phối lịch sử
+// ──────────────────────────────────────────────
+function analyzeBayes(hist) {
+  if (hist.length < 5) return { vote: null, confidence: 0 };
+
+  const recent = hist.slice(-15);
+  let tai = 0, xiu = 0;
+  let sumTai = 0, sumXiu = 0;
+
+  recent.forEach(h => {
+    if (h.ket_qua === "Tài") { tai++; sumTai += h.tong; }
+    else { xiu++; sumXiu += h.tong; }
+  });
+
+  const total = tai + xiu;
+  const pTai = tai / total;
+  const pXiu = xiu / total;
+
+  // Xu hướng tổng điểm gần đây
+  const lastTong = hist[hist.length - 1].tong;
+  const avgTong = recent.reduce((a, h) => a + h.tong, 0) / recent.length;
+
+  // Nếu tổng gần đây thấp → xu hướng Xỉu, cao → Tài
+  let vote, confidence;
+  if (pTai > 0.65) {
+    vote = "Xỉu"; confidence = Math.min(0.75, pTai * 0.9);
+  } else if (pXiu > 0.65) {
+    vote = "Tài"; confidence = Math.min(0.75, pXiu * 0.9);
+  } else {
+    // Dùng độ lệch tổng gần nhất
+    vote = lastTong > avgTong ? "Xỉu" : "Tài";
+    confidence = 0.52 + Math.abs(lastTong - avgTong) / 36;
+  }
+
+  return { vote, confidence: Math.min(confidence, 0.78) };
+}
+
+// ──────────────────────────────────────────────
+//  THUẬT TOÁN 4: TỰ ĐIỀU CHỈNH KHI SAI LIÊN TIẾP
+//  Nếu sai >= 3 lần → đảo ngược kết quả dự đoán
+// ──────────────────────────────────────────────
+function applyCorrection(vote) {
+  if (state.wrongStreak >= CONFIG.MAX_WRONG_STREAK) {
+    console.log(colorize(`  ⚠️  Sai ${state.wrongStreak} lần liên tiếp → Đảo chiều dự đoán!`, "yellow"));
+    return vote === "Tài" ? "Xỉu" : "Tài";
+  }
+  return vote;
+}
+
+// ──────────────────────────────────────────────
+//  TỔNG HỢP DỰ ĐOÁN (Ensemble Voting)
+// ──────────────────────────────────────────────
+function makePrediction(hist, apiSuggestion) {
+  const streak  = analyzeStreak(hist);
+  const pattern = analyzePattern(hist);
+  const bayes   = analyzeBayes(hist);
+
+  const votes = { "Tài": 0, "Xỉu": 0 };
+
+  // Cộng điểm có trọng số
+  function addVote(result, weight) {
+    if (result.vote && result.confidence > 0) {
+      votes[result.vote] += result.confidence * weight;
+    }
+  }
+
+  addVote(streak,  CONFIG.WEIGHTS.streak);
+  addVote(pattern, CONFIG.WEIGHTS.pattern);
+  addVote(bayes,   CONFIG.WEIGHTS.bayes);
+
+  // API gợi ý
+  if (apiSuggestion) {
+    votes[apiSuggestion] += CONFIG.WEIGHTS.api;
+  }
+
+  const finalVote = votes["Tài"] >= votes["Xỉu"] ? "Tài" : "Xỉu";
+  const totalScore = votes["Tài"] + votes["Xỉu"];
+  const confidence = totalScore > 0
+    ? Math.round((votes[finalVote] / totalScore) * 100)
+    : 50;
+
+  const corrected = applyCorrection(finalVote);
+
   return {
-    total_verified: total,
-    correct: correct,
-    accuracy: parseFloat(((correct / total) * 100).toFixed(2))
+    du_doan: corrected,
+    do_tin_cay: `${confidence}%`,
+    detail: {
+      streak:  `${streak.vote || "?"} (${Math.round(streak.confidence * 100)}%)`,
+      pattern: `${pattern.vote || "?"} (${Math.round(pattern.confidence * 100)}%)`,
+      bayes:   `${bayes.vote || "?"} (${Math.round(bayes.confidence * 100)}%)`,
+      api:     `${apiSuggestion || "?"} (API)`,
+    },
   };
 }
 
-// ================= GỌI API NGUỒN =================
-async function fetchResults() {
+// ──────────────────────────────────────────────
+//  CẬP NHẬT KẾT QUẢ & THỐNG KÊ
+// ──────────────────────────────────────────────
+function updateResult(phien, ket_qua) {
+  const pred = state.predictions.find(p => p.phien === phien);
+  if (!pred || pred.ket_qua !== undefined) return;
+
+  pred.ket_qua = ket_qua;
+  pred.dung = pred.du_doan === ket_qua;
+
+  state.totalPredictions++;
+  if (pred.dung) {
+    state.totalCorrect++;
+    state.wrongStreak = 0;
+    console.log(colorize(`  ✅ Phiên ${phien}: DỰ ĐOÁN ĐÚNG! (${pred.du_doan})`, "green"));
+  } else {
+    state.wrongStreak++;
+    console.log(colorize(`  ❌ Phiên ${phien}: Sai (dự: ${pred.du_doan} | thực: ${ket_qua}) | Sai liên tiếp: ${state.wrongStreak}`, "red"));
+  }
+
+  const acc = state.totalPredictions > 0
+    ? ((state.totalCorrect / state.totalPredictions) * 100).toFixed(1)
+    : "0.0";
+  console.log(colorize(`  📊 Tổng độ chính xác: ${acc}% (${state.totalCorrect}/${state.totalPredictions})`, "cyan"));
+}
+
+// ──────────────────────────────────────────────
+//  VÒNG LẶP CHÍNH
+// ──────────────────────────────────────────────
+async function loop() {
   try {
-    const params = { platform_id: PLATFORM_ID, gid: GID_DEFAULT };
-    const response = await axios.get(API_SOURCE, { params, timeout: 5000 });
-    if (response.status !== 200) {
-      console.error(`API nguồn trả về lỗi ${response.status}`);
-      return [];
+    const data = await fetchLatest();
+
+    const phienHienTai = data.phien;
+    const phienDuDoan  = data.phien_du_doan;
+
+    // Cập nhật kết quả phiên trước nếu có
+    if (state.lastPhien && phienHienTai !== state.lastPhien) {
+      updateResult(phienHienTai, data.ket_qua);
     }
-    const data = response.data;
-    // Điều chỉnh theo cấu trúc thực tế. Giả sử data.data là mảng các phiên
-    if (data && Array.isArray(data.data)) {
-      return data.data;
-    } else if (Array.isArray(data)) {
-      return data;
-    } else {
-      console.error('Định dạng dữ liệu không rõ:', data);
-      return [];
+
+    // Thêm phiên hiện tại vào lịch sử
+    const t = tong(data.xuc_xac);
+    const entry = {
+      phien: phienHienTai,
+      ket_qua: data.ket_qua,
+      xuc_xac: data.xuc_xac,
+      tong: t,
+    };
+
+    // Tránh trùng lặp
+    if (!state.history.find(h => h.phien === phienHienTai)) {
+      state.history.push(entry);
+      if (state.history.length > CONFIG.HISTORY_SIZE) {
+        state.history.shift();
+      }
     }
+
+    // Tạo dự đoán cho phiên tiếp theo
+    if (!state.predictions.find(p => p.phien === phienDuDoan)) {
+      const pred = makePrediction(state.history, data.du_doan);
+
+      state.predictions.push({ phien: phienDuDoan, ...pred });
+      if (state.predictions.length > 50) state.predictions.shift();
+
+      console.log("\n" + "═".repeat(55));
+      console.log(colorize(`  [${now()}] Phiên ${phienHienTai}: ${data.ket_qua} | 🎲 ${data.xuc_xac.join("-")} (tổng: ${t})`, "cyan"));
+      console.log(`  🔮 Dự đoán phiên ${phienDuDoan}: ` + colorize(pred.du_doan, pred.du_doan === "Tài" ? "yellow" : "green") + ` | Tin cậy: ${pred.do_tin_cay}`);
+      console.log(`     ├ Streak:  ${pred.detail.streak}`);
+      console.log(`     ├ Pattern: ${pred.detail.pattern}`);
+      console.log(`     ├ Bayes:   ${pred.detail.bayes}`);
+      console.log(`     └ API:     ${pred.detail.api}`);
+    }
+
+    state.lastPhien = phienHienTai;
+
   } catch (err) {
-    console.error('Lỗi fetch:', err.message);
-    return [];
+    console.error(colorize(`  [${now()}] Lỗi: ${err.message}`, "red"));
   }
 }
 
-async function pollNewSessions() {
-  console.log('Bắt đầu fetch dữ liệu...');
-  let lastId = getLastSessionId();
-  while (true) {
-    const sessions = await fetchResults();
-    if (sessions.length > 0) {
-      for (const s of sessions) {
-        const sid = s.session_id || s.gid; // tùy API
-        const res = s.result;
-        const ts = s.time || new Date().toISOString();
-        if (sid && res) {
-          saveResult(sid, res, ts);
-          updatePredictionResult(sid, res);
-        }
-      }
-      // Kiểm tra xem có phiên mới nhất không
-      const currentLast = getLastSessionId();
-      if (currentLast !== lastId) {
-        lastId = currentLast;
-      }
-    }
-    await new Promise(resolve => setTimeout(resolve, FETCH_INTERVAL));
-  }
-}
+// ──────────────────────────────────────────────
+//  KHỞI ĐỘNG
+// ──────────────────────────────────────────────
+console.log(colorize("╔══════════════════════════════════════════════════════╗", "cyan"));
+console.log(colorize("║   HitClub MD5 - Dự đoán thông minh đa thuật toán    ║", "cyan"));
+console.log(colorize("╚══════════════════════════════════════════════════════╝", "cyan"));
+console.log(`  API: ${API_URL}`);
+console.log(`  Poll: ${CONFIG.POLL_INTERVAL_MS / 1000}s | History: ${CONFIG.HISTORY_SIZE} phiên | Max sai: ${CONFIG.MAX_WRONG_STREAK}\n`);
 
-// ================= THUẬT TOÁN PHÂN TÍCH CẦU =================
-function analyzePattern(history) {
-  if (!history || history.length < 2) return null;
-
-  const results = history.map(item => item.result); // mảng 'tai'/'xiu'
-  const MIN_MATCH = 3;
-
-  let bestTai = 0, bestXiu = 0;
-  let found = false;
-
-  // Duyệt từ mẫu dài nhất đến ngắn nhất
-  for (let len = Math.min(Math.floor(results.length / 2), 10); len >= MIN_MATCH; len--) {
-    const pattern = results.slice(-len);
-    let countTai = 0, countXiu = 0;
-    // Đếm số lần pattern xuất hiện trong lịch sử (trừ lần cuối cùng đang xét)
-    for (let i = 0; i <= results.length - len - 1; i++) {
-      if (results.slice(i, i + len).every((val, idx) => val === pattern[idx])) {
-        if (i + len < results.length) {
-          const next = results[i + len];
-          if (next === 'tai') countTai++;
-          else if (next === 'xiu') countXiu++;
-        }
-      }
-    }
-    if (countTai + countXiu > 0) {
-      bestTai = countTai;
-      bestXiu = countXiu;
-      found = true;
-      break; // lấy mẫu dài nhất có dữ liệu
-    }
-  }
-
-  if (found) {
-    if (bestTai > bestXiu) return 'tai';
-    if (bestXiu > bestTai) return 'xiu';
-  }
-
-  // Heuristic: cầu bệt, 1-1
-  if (results.length >= 3) {
-    const last3 = results.slice(-3);
-    if (last3.every(v => v === last3[0])) {
-      return results[results.length - 1]; // bệt
-    }
-    if (last3[0] !== last3[1] && last3[1] !== last3[2] && last3[0] === last3[2]) {
-      return results[results.length - 1] === 'tai' ? 'xiu' : 'tai'; // 1-1
-    }
-  }
-
-  // Mặc định tỉ lệ tổng
-  const totalTai = results.filter(r => r === 'tai').length;
-  const totalXiu = results.filter(r => r === 'xiu').length;
-  return totalTai > totalXiu ? 'tai' : 'xiu';
-}
-
-function generateMD5(sessionId, prediction) {
-  return crypto.createHash('md5').update(`${sessionId}${prediction}${SECRET_KEY}`).digest('hex');
-}
-
-function getNextSessionId(lastSid) {
-  if (!lastSid) return `next_${Date.now()}`;
-  const num = parseInt(lastSid, 10);
-  return isNaN(num) ? `next_${Date.now()}` : String(num + 1);
-}
-
-// ================= EXPRESS APP =================
-const app = express();
-app.use(express.json());
-
-// API dự đoán
-app.get('/api/predict', (req, res) => {
-  const gid = req.query.gid || GID_DEFAULT; // có thể dùng sau
-  const history = getHistory(HISTORY_LIMIT);
-  if (history.length === 0) {
-    return res.status(503).json({ error: 'Chưa có dữ liệu lịch sử' });
-  }
-
-  const prediction = analyzePattern(history);
-  if (!prediction) {
-    return res.status(500).json({ error: 'Không thể dự đoán' });
-  }
-
-  const lastSid = history[history.length - 1].session_id;
-  const nextSid = getNextSessionId(lastSid);
-  const md5 = generateMD5(nextSid, prediction);
-
-  savePrediction(nextSid, prediction, md5);
-
-  return res.json({
-    session_id: nextSid,
-    prediction: prediction,
-    md5: md5,
-    timestamp: new Date().toISOString(),
-    message: 'Dự đoán đã được khóa bằng MD5'
-  });
-});
-
-// API xác minh
-app.post('/api/verify', (req, res) => {
-  const { session_id, actual_result } = req.body;
-  if (!session_id || !actual_result) {
-    return res.status(400).json({ error: 'Thiếu session_id hoặc actual_result' });
-  }
-  const row = db.prepare('SELECT prediction, md5_hash FROM predictions WHERE session_id = ?').get(session_id);
-  if (!row) {
-    return res.status(404).json({ error: 'Không tìm thấy dự đoán cho session này' });
-  }
-  const expectedMd5 = generateMD5(session_id, row.prediction);
-  const md5Match = expectedMd5 === row.md5_hash;
-  const correct = row.prediction === actual_result;
-  updatePredictionResult(session_id, actual_result);
-  return res.json({
-    session_id,
-    predicted: row.prediction,
-    actual: actual_result,
-    correct,
-    md5_match: md5Match,
-    verified: md5Match && correct
-  });
-});
-
-// API lịch sử dự đoán
-app.get('/api/history', (req, res) => {
-  const limit = parseInt(req.query.limit, 10) || 100;
-  const rows = getPredictions(limit);
-  return res.json(rows);
-});
-
-// API độ chính xác
-app.get('/api/accuracy', (req, res) => {
-  return res.json(getAccuracy());
-});
-
-// ================= KHỞI ĐỘNG =================
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server dự đoán Tài/Xỉu chạy trên cổng ${PORT}`);
-  // Chạy tiến trình fetch nền
-  pollNewSessions(); // async function, không cần await vì chạy vòng lặp vô tận
-});
+loop(); // Chạy ngay lập tức
+setInterval(loop, CONFIG.POLL_INTERVAL_MS);
